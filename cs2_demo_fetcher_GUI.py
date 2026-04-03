@@ -22,6 +22,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
@@ -55,7 +56,6 @@ PAL = {
 }
 
 def _apply_theme(root):
-    """Apply dark theme using only ttk.Style — no option_add that breaks dialogs."""
     style = ttk.Style(root)
     if "clam" in style.theme_names():
         style.theme_use("clam")
@@ -94,6 +94,9 @@ SHARECODE_ALPHABET = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefhijkmnopqrstuvwxyz23456789"
 SHARECODE_BASE     = len(SHARECODE_ALPHABET)
 
 DOWNLOAD_WORKERS  = 4
+# Max observed ID difference between the SAME match downloaded by two different tools.
+# Consecutive DIFFERENT matches always differ by more than this (~7.9T minimum observed).
+_SAME_MATCH_THRESHOLD = 6_000_000_000_000   # 6 trillion
 BOILER_DELAY      = 4
 API_RATE_DELAY    = 0.4
 MAX_RETRIES       = 3
@@ -125,30 +128,61 @@ _RE_DEMO_URL     = re.compile(r'https?://[^\x00-\x1f\x7f\s]{15,}\.dem(?:\.bz2)?'
 _RE_FALLBACK_URL = re.compile(r'https?://[^\x00-\x1f\x7f\s]{15,}')
 _BZ2_MAGIC       = b'BZ'
 
+# ◄◄◄ FIXED — sentinel to distinguish "skipped" from "downloaded"
+_SKIPPED = "__skipped__"
 
 # ════════════════════════════════════════════════════════════════
 #  THREAD-SAFE UTILS
 # ════════════════════════════════════════════════════════════════
 
 class _SafeSet:
-    __slots__ = ('_data', '_lock')
+    __slots__ = ('_data', '_ints', '_lock')
+
     def __init__(self, initial=None):
-        self._data = set(initial) if initial else set()
+        self._data = set()
+        self._ints = set()   # integer versions for proximity check
         self._lock = threading.Lock()
+        if initial:
+            for item in initial:
+                self._data.add(item)
+                try:
+                    self._ints.add(int(item))
+                except (ValueError, TypeError):
+                    pass
+
     def add(self, item):
-        with self._lock: self._data.add(item)
+        with self._lock:
+            self._data.add(item)
+            try:
+                self._ints.add(int(item))
+            except (ValueError, TypeError):
+                pass
+
     def __contains__(self, item):
-        with self._lock: return item in self._data
+        with self._lock:
+            # 1. Exact match (fast path)
+            if item in self._data:
+                return True
+            # 2. Proximity match — same match downloaded by a different tool
+            #    produces a match ID up to ~5T different from ours.
+            #    Consecutive DIFFERENT matches always differ by >7T, so 6T is safe.
+            try:
+                v = int(item)
+                return any(
+                    abs(v - x) <= _SAME_MATCH_THRESHOLD
+                    for x in self._ints
+                )
+            except (ValueError, TypeError):
+                return False
+
     def __len__(self):
         with self._lock: return len(self._data)
-
 
 # ════════════════════════════════════════════════════════════════
 #  PATH HELPERS (Python 3.8 compatible)
 # ════════════════════════════════════════════════════════════════
 
 def _is_safe_path(base: Path, target: Path) -> bool:
-    """Check that target is inside base (works on Python 3.8+)."""
     try:
         target.resolve().relative_to(base.resolve())
         return True
@@ -194,9 +228,14 @@ def _valid_share_code(code):
 
 def _scan_folder(path: Path) -> _SafeSet:
     ids = set()
-    for dem in path.glob("*.dem"):
+    # rglob instead of glob → scans subfolders too
+    for dem in path.rglob("*.dem"):
         m = _RE_MID.search(dem.stem)
-        if m: ids.add(str(int(m.group(1))))
+        if m:
+            try:
+                ids.add(str(int(m.group(1))))
+            except ValueError:
+                pass
     return _SafeSet(ids)
 
 def _is_present(mid, known): return str(mid) in known
@@ -450,13 +489,40 @@ def _boiler_test(boiler, log=print):
 #  STEAM API — share code chaining
 # ════════════════════════════════════════════════════════════════
 
-def _next_code(api_key, steam_id, auth_code, known_code):
+def _next_code(api_key, steam_id, auth_code, known_code, log=print):
+    """Returns (code, ok, http_status)
+       ok=True  → API responded properly (code may still be None = end of chain).
+       ok=False → transient or fatal error; check http_status.
+       http_status=403 → wrong API key (fatal).
+       http_status=412 → share code mismatch (fatal, needs reset).
+       http_status=202 → no new match yet = legitimate end of chain."""
     url = (f"{STEAM_NEXT_CODE_URL}?key={api_key}&steamid={steam_id}"
            f"&steamidkey={auth_code}&knowncode={known_code}")
-    data = _http_get_json(url, timeout=10)
-    if not data: return None
-    c = data.get("result", {}).get("nextcode", "")
-    return c if c and c != "n/a" else None
+    try:
+        if HAS_REQUESTS:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "cs2dl/4"})
+            if r.status_code == 200:
+                c = r.json().get("result", {}).get("nextcode", "")
+                if c and c != "n/a":
+                    return c, True, 200
+                return None, True, 200    # legitimate end of chain
+            if r.status_code == 202:
+                return None, True, 202    # "no new match yet" = legitimate end, not an error
+            if r.status_code == 403:
+                return None, False, 403   # wrong API key — no point retrying
+            if r.status_code == 412:
+                return None, False, 412   # share code mismatch — needs manual reset
+            return None, False, r.status_code
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": "cs2dl/4"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            c = data.get("result", {}).get("nextcode", "")
+            if c and c != "n/a":
+                return c, True, 200
+            return None, True, 200
+    except Exception:
+        return None, False, -1
 
 def collect_codes(player, known_ids, log=print):
     start = player.get("last_known_code") or player.get("oldest_share_code", "")
@@ -467,15 +533,36 @@ def collect_codes(player, known_ids, log=print):
         if not _is_present(mid, known_ids): codes.append(start)
     except ValueError: pass
     cur, seen = start, {start}
+    failures = 0
+    max_failures = 5
     while True:
-        nxt = _next_code(player["api_key"], player["steam_id"],
-                         player["auth_code"], cur)
-        if not nxt or nxt in seen: break
+        nxt, ok, status = _next_code(player["api_key"], player["steam_id"],
+                                     player["auth_code"], cur, log)
+        if not ok:
+            # 403 = wrong API key or auth code — no point retrying
+            if status == 403:
+                log("  [✗]  API returned 403 — check your API key and auth code")
+                break
+            # 412 = share code doesn't match this account — needs manual reset
+            if status == 412:
+                log("  [✗]  API returned 412 — share code mismatch, "
+                    "use 'Reset Share Code' and enter a recent one from this account")
+                break
+            failures += 1
+            if failures >= max_failures:
+                log(f"  [⚠]  API failed {failures} times in a row, stopping chain")
+                break
+            log(f"  [⚠]  API call failed (HTTP {status}), retrying "
+                f"({failures}/{max_failures})…")
+            time.sleep(RETRY_BACKOFF * failures)
+            continue
+        failures = 0                # reset on success
+        if not nxt or nxt in seen:
+            break                   # legitimate end of chain
         seen.add(nxt); codes.append(nxt); cur = nxt
         time.sleep(API_RATE_DELAY)
     log(f"  [→] {len(codes)} new match(es)")
     return codes
-
 
 # ════════════════════════════════════════════════════════════════
 #  PHASE 1 — resolve URLs via boiler
@@ -491,26 +578,36 @@ def resolve_urls(codes, boiler, known_ids, dl_path, log=print):
         except ValueError:
             log(f"{pre} [⏭]  Invalid: {code[:40]}…")
             stats["errors"] += 1; continue
+
+        # ◄◄◄ FIXED — check BOTH match-id index AND any file on disk with this mid
         if _is_present(mid, known_ids):
-            log(f"{pre} [⏭]  Already present")
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
+
         name  = csdm_name(mid, oid)
         final = dl_path / f"{name}.dem"
-        if final.exists():
+
+        # ◄◄◄ FIXED — also glob for any file with this match id (different oid)
+        mid_str = f"match730_{mid:021d}_"
+        already_on_disk = final.exists() or any(dl_path.glob(f"{mid_str}*.dem"))
+
+        if already_on_disk:
             known_ids.add(str(mid))
-            log(f"{pre} [⏭]  File exists")
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
+
         log(f"{pre} [🔍]  {code}  →  boiler…")
         url, rc = _boiler_url(boiler, mid, oid, token, log=log)
         if not url:
             if rc == 8:
                 stats["expired"] += 1; log(f"{pre} [⌛]  Expired")
-                stats["last_ok_code"] = code
+                stats["last_ok_code"] = code   # expired = permanently gone, safe to skip
             else:
-                stats["errors"] += 1; log(f"{pre} [!]   No URL")
+                stats["errors"] += 1; log(f"{pre} [!]   No URL (boiler rc={rc})")
+                # do NOT set last_ok_code — boiler errors are transient, retry next run
         else:
             tasks.append({"mid":mid, "oid":oid, "name":name, "url":url, "code":code})
             stats["resolved"] += 1; log(f"{pre} [✓]   URL ready")
+            # intentionally NOT setting last_ok_code here — cursor advances
+            # only after a confirmed download (handled in run_scan via best dict)
         if i < total: time.sleep(BOILER_DELAY)
     return tasks, stats
 
@@ -531,11 +628,24 @@ def _decompress_bz2(src, dest):
     except Exception as e:
         return False, str(e)
 
+# ◄◄◄ FIXED — return _SKIPPED instead of True when file already exists
 def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     mid, oid, name, url = task["mid"], task["oid"], task["name"], task["url"]
     final = dl_path / f"{name}.dem"
-    if final.exists() or _is_present(mid, known_ids):
-        return True, ""
+
+    # Check exact file AND any file with same match id, recursively
+    mid_str = f"match730_{mid:021d}_"
+    mid_plain = str(mid)  # without zero-padding, for tools that don't zero-pad
+    already = (
+        final.exists()
+        or _is_present(mid, known_ids)
+        or any(dl_path.rglob(f"{mid_str}*.dem"))        # zero-padded, any subfolder
+        or any(dl_path.rglob(f"*{mid_plain}*.dem"))     # non-padded, any subfolder
+    )
+    if already:
+        known_ids.add(str(mid))
+        return True, _SKIPPED
+
     is_bz2 = url.endswith(".bz2")
     suffix = ".dem.bz2" if is_bz2 else ".dem"
     tmp = dl_path / f"_tmp_{name}{suffix}"
@@ -546,6 +656,9 @@ def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     ok, err = _http_download(url, tmp, on_progress=on_prog)
     if not ok:
         tmp.unlink(missing_ok=True)
+        # 5xx = Valve CDN blip, cursor was not advanced, will retry next run
+        if any(code in err for code in ("502", "503", "504")):
+            return False, f"Valve CDN error (retry next run): {err[:60]}"
         return False, f"Download failed: {err[:80]}"
 
     verr = _validate_file(tmp, is_bz2)
@@ -567,12 +680,13 @@ def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     known_ids.add(str(mid))
     return True, ""
 
+# ◄◄◄ FIXED — separate skipped from actually downloaded
 def download_all(tasks, dl_path, known_ids, log=print, progress_cb=None):
-    if not tasks: return []
+    if not tasks: return [], []
     n = len(tasks)
     workers = min(DOWNLOAD_WORKERS, n)
     log(f"\n[⬇]  {n} demo(s) — {workers} workers\n")
-    succeeded, errors = [], []
+    downloaded, skipped, errors = [], [], []
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_dl_one, t, dl_path, known_ids, log, progress_cb): t
@@ -582,8 +696,11 @@ def download_all(tasks, dl_path, known_ids, log=print, progress_cb=None):
             short = ("…" + task["name"][-40:]) if len(task["name"]) > 41 else task["name"]
             try:
                 ok, reason = f.result()
-                if ok:
-                    succeeded.append(task)
+                if ok and reason == _SKIPPED:
+                    skipped.append(task)
+                    log(f"  [⏭] {short}  (already on disk)")
+                elif ok:
+                    downloaded.append(task)
                     log(f"  [✓] {short}")
                 else:
                     errors.append((short, reason))
@@ -592,6 +709,8 @@ def download_all(tasks, dl_path, known_ids, log=print, progress_cb=None):
                 errors.append((short, str(e)))
                 log(f"  [✗] {short} — {e}")
 
+    if skipped:
+        log(f"\n  [⏭] {len(skipped)} already on disk (not re-downloaded)")
     if errors:
         reasons: Dict[str, List[str]] = {}
         for nm, reason in errors:
@@ -601,13 +720,14 @@ def download_all(tasks, dl_path, known_ids, log=print, progress_cb=None):
             log(f"\n    ▸ {reason}  ({len(names)})")
             for nm in names[:5]: log(f"      — {nm}")
             if len(names) > 5: log(f"      … +{len(names)-5}")
-    return succeeded
+    return downloaded, skipped
 
 
 # ════════════════════════════════════════════════════════════════
 #  SCAN ENGINE
 # ════════════════════════════════════════════════════════════════
 
+# ◄◄◄ FIXED — use downloaded vs skipped properly for cursor tracking
 def run_scan(cfg, dl_path, log=print, progress_cb=None):
     players = cfg.get("players", [])
     if not players: log("\n  [!] No players — add one first."); return
@@ -635,7 +755,7 @@ def run_scan(cfg, dl_path, log=print, progress_cb=None):
             ms = str(t["mid"])
             if ms in seen_mids: dupes += 1; continue
             seen_mids.add(ms); unique.append(t)
-            
+
         parts = []
         if unique:            parts.append(f"{len(unique)} to DL")
         if dupes:             parts.append(f"{dupes} already queued")
@@ -649,15 +769,25 @@ def run_scan(cfg, dl_path, log=print, progress_cb=None):
         for t in unique: task_player[t["name"]] = player
         all_tasks.extend(unique); log("")
 
+    # Advance cursor for players that had skipped codes (before downloading)
     for p in players:
         if p["steam_id"] in player_cursor:
             p["last_known_code"] = player_cursor[p["steam_id"]]
 
-    succeeded = download_all(all_tasks, dl_path, known_ids, log, progress_cb)
+    downloaded, skipped = download_all(all_tasks, dl_path, known_ids, log, progress_cb)
 
+    # Only advance cursor further based on ACTUALLY downloaded demos
     order = {t["name"]: i for i, t in enumerate(all_tasks)}
     best: Dict[str, Tuple[int, str]] = {}
-    for t in succeeded:
+    for t in downloaded:  # ◄◄◄ FIXED — only real downloads, not skips
+        p = task_player.get(t["name"])
+        if not p: continue
+        pid, o, c = p["steam_id"], order.get(t["name"], -1), t.get("code", "")
+        if c:
+            prev = best.get(pid, (-1, ""))
+            if o > prev[0]: best[pid] = (o, c)
+    # Also count skipped demos for cursor (they exist on disk = safe to advance past)
+    for t in skipped:
         p = task_player.get(t["name"])
         if not p: continue
         pid, o, c = p["steam_id"], order.get(t["name"], -1), t.get("code", "")
@@ -670,7 +800,8 @@ def run_scan(cfg, dl_path, log=print, progress_cb=None):
 
     save_config(cfg)
     log(f"\n{'═'*56}")
-    log(f"  Done — {len(succeeded)}/{len(all_tasks)} demo(s) downloaded")
+    log(f"  Done — {len(downloaded)} downloaded, {len(skipped)} skipped, "
+        f"{len(all_tasks) - len(downloaded) - len(skipped)} failed")
     log(f"  {dl_path}")
     log(f"{'═'*56}")
 
@@ -680,8 +811,6 @@ def run_scan(cfg, dl_path, log=print, progress_cb=None):
 # ════════════════════════════════════════════════════════════════
 
 class PlayerDialog(tk.Toplevel):
-    """Modal dialog for adding/editing a player."""
-
     FIELDS = [
         ("name",            "Nickname:",          ""),
         ("steam_id",        "SteamID64:",         ""),
@@ -731,7 +860,6 @@ class PlayerDialog(tk.Toplevel):
                 lnk.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
                 lnk.grid(row=i, column=2, sticky="w", padx=(0, 10))
 
-        # Buttons
         bf = tk.Frame(self, bg=PAL["bg"])
         bf.grid(row=len(self.FIELDS), column=0, columnspan=3, pady=10)
 
@@ -774,8 +902,6 @@ class PlayerDialog(tk.Toplevel):
 # ════════════════════════════════════════════════════════════════
 
 class ResetCodeDialog(tk.Toplevel):
-    """Simple dialog to enter a new share code."""
-
     def __init__(self, parent, player_name, current, initial):
         super().__init__(parent)
         self.title("Reset Share Code")
@@ -836,7 +962,7 @@ class App(tk.Tk):
         self.dl_path = self._init_dl_path()
         self._busy = False
         self._last_progress_update = 0.0
-        self._dl_progress = {}  # <--- THIS IS THE FIXED LINE
+        self._dl_progress = {}
         self._dl_progress_lock = threading.Lock()
 
         self._build_ui()
@@ -857,7 +983,6 @@ class App(tk.Tk):
     # ── BUILD UI ─────────────────────────────────────────────
 
     def _build_ui(self):
-        # Top bar: folder
         top = ttk.Frame(self)
         top.pack(fill="x", padx=10, pady=(10, 0))
         ttk.Label(top, text="📁 Download Folder:").pack(side="left")
@@ -866,15 +991,12 @@ class App(tk.Tk):
                   foreground=PAL["link"]).pack(side="left", padx=(5, 10))
         ttk.Button(top, text="Change…", command=self._change_folder).pack(side="left")
 
-        # Main area: left panel + right log
         pane = ttk.PanedWindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # ── Left panel ──
         left = ttk.Frame(pane, width=270)
         pane.add(left, weight=0)
 
-        # Player list
         plf = ttk.LabelFrame(left, text="Players")
         plf.pack(fill="both", expand=True, padx=(0, 5))
 
@@ -891,7 +1013,6 @@ class App(tk.Tk):
         ttk.Button(pb, text="✏ Edit",   command=self._edit_player,   width=8).pack(side="left", padx=2)
         ttk.Button(pb, text="✗ Remove", command=self._remove_player, width=8).pack(side="left", padx=2)
 
-        # Action buttons
         af = ttk.LabelFrame(left, text="Actions")
         af.pack(fill="x", padx=(0, 5), pady=(10, 0))
 
@@ -907,10 +1028,8 @@ class App(tk.Tk):
         ]:
             ttk.Button(af, text=txt, command=cmd).pack(fill="x", padx=8, pady=2)
 
-        # Spacer at bottom of actions
         ttk.Frame(af).pack(pady=4)
 
-        # ── Right panel: log ──
         right = ttk.Frame(pane)
         pane.add(right, weight=1)
 
@@ -930,7 +1049,6 @@ class App(tk.Tk):
         self.log_text.tag_configure("info", foreground=PAL["info"])
         self.log_text.tag_configure("timestamp", foreground="#6a6a6a")
 
-        # ── Bottom bar: progress ──
         bot = ttk.Frame(self)
         bot.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -945,21 +1063,22 @@ class App(tk.Tk):
     # ── LOGGING (thread-safe) ────────────────────────────────
 
     def _log(self, msg, tag=None):
-        from datetime import datetime
         stamp = datetime.now().strftime("[%H:%M:%S] ")
 
         def _do():
             self.log_text.configure(state="normal")
-            # Insert timestamp in dim color
-            self.log_text.insert("end", stamp, "timestamp")
-            # Auto-detect tag
             t = tag
             if not t:
                 if   "[✓]" in msg: t = "ok"
                 elif "[✗]" in msg: t = "fail"
                 elif "[⚠]" in msg or "[⌛]" in msg: t = "warn"
                 elif "═" in msg: t = "info"
-            self.log_text.insert("end", msg + "\n", t or ())
+            for line in msg.split("\n"):
+                if line.strip():
+                    self.log_text.insert("end", stamp, "timestamp")
+                    self.log_text.insert("end", line + "\n", t or ())
+                else:
+                    self.log_text.insert("end", "\n")
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
 
@@ -982,7 +1101,7 @@ class App(tk.Tk):
         now = time.monotonic()
         is_done = dl >= total
         if not is_done and (now - self._last_progress_update) < 0.1:
-            return                          # throttle UI updates
+            return
         self._last_progress_update = now
 
         pct = agg_dl * 100 / agg_total if agg_total > 0 else 0
@@ -999,7 +1118,6 @@ class App(tk.Tk):
     # ── PLAYER MANAGEMENT ────────────────────────────────────
 
     def _refresh_players(self):
-        """Refresh player listbox. Must be called from main thread."""
         def _do():
             self.player_list.delete(0, "end")
             for p in self.cfg.get("players", []):
@@ -1112,7 +1230,7 @@ class App(tk.Tk):
             run_scan(self.cfg, self.dl_path, log=self._log, progress_cb=self._progress_cb)
             self._refresh_players()
         self._run_threaded(do)
-        
+
     def _test_gc(self):
         def do():
             boiler = ensure_boiler(self._log)
@@ -1144,7 +1262,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Show error in a messagebox if GUI fails to start
         try:
             root = tk.Tk()
             root.withdraw()

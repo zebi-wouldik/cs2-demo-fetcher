@@ -54,6 +54,10 @@ SHARECODE_ALPHABET = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefhijkmnopqrstuvwxyz23456789"
 SHARECODE_BASE     = len(SHARECODE_ALPHABET)
 
 DOWNLOAD_WORKERS  = 4
+# Max observed ID difference between the SAME match downloaded by two different tools.
+# Consecutive DIFFERENT matches always differ by more than this.
+_SAME_MATCH_THRESHOLD = 6_000_000_000_000   # 6 trillion
+
 BOILER_DELAY      = 4
 API_RATE_DELAY    = 0.4
 MAX_RETRIES       = 3
@@ -92,14 +96,45 @@ _BZ2_MAGIC       = b'BZ'
 # ════════════════════════════════════════════════════════════════
 
 class _SafeSet:
-    __slots__ = ('_data', '_lock')
+    __slots__ = ('_data', '_ints', '_lock')
+
     def __init__(self, initial=None):
-        self._data = set(initial) if initial else set()
+        self._data = set()
+        self._ints = set()   # integer versions for proximity check
         self._lock = threading.Lock()
+        if initial:
+            for item in initial:
+                self._data.add(item)
+                try:
+                    self._ints.add(int(item))
+                except (ValueError, TypeError):
+                    pass
+
     def add(self, item):
-        with self._lock: self._data.add(item)
+        with self._lock:
+            self._data.add(item)
+            try:
+                self._ints.add(int(item))
+            except (ValueError, TypeError):
+                pass
+
     def __contains__(self, item):
-        with self._lock: return item in self._data
+        with self._lock:
+            # 1. Exact match (fast path)
+            if item in self._data:
+                return True
+            # 2. Proximity match — same match downloaded by a different tool
+            #    produces an ID up to ~5T different. Consecutive different
+            #    matches always differ by >7T, so 6T threshold is safe.
+            try:
+                v = int(item)
+                return any(
+                    abs(v - x) <= _SAME_MATCH_THRESHOLD
+                    for x in self._ints
+                )
+            except (ValueError, TypeError):
+                return False
+
     def __len__(self):
         with self._lock: return len(self._data)
 
@@ -233,9 +268,13 @@ def _selftest():
 
 def _scan_folder(path: Path) -> _SafeSet:
     ids = set()
-    for dem in path.glob("*.dem"):
+    for dem in path.rglob("*.dem"):   # rglob = subfolders too
         m = _RE_MID.search(dem.stem)
-        if m: ids.add(str(int(m.group(1))))
+        if m:
+            try:
+                ids.add(str(int(m.group(1))))
+            except (ValueError, TypeError):
+                pass
     return _SafeSet(ids)
 
 def _is_present(mid, known): return str(mid) in known
@@ -512,12 +551,39 @@ def _boiler_recent_matches(boiler, debug=False):
 # ════════════════════════════════════════════════════════════════
 
 def _next_code(api_key, steam_id, auth_code, known_code):
+    """Returns (code, ok, http_status).
+       ok=True  → API responded properly (code may be None = end of chain).
+       ok=False → error; check http_status.
+       202 → no new match yet  = clean end of chain.
+       403 → wrong API key     = fatal, stop retrying.
+       412 → share code mismatch = fatal, needs manual reset."""
     url = (f"{STEAM_NEXT_CODE_URL}?key={api_key}&steamid={steam_id}"
            f"&steamidkey={auth_code}&knowncode={known_code}")
-    data = _http_get_json(url, timeout=10)
-    if not data: return None
-    c = data.get("result", {}).get("nextcode", "")
-    return c if c and c != "n/a" else None
+    try:
+        if HAS_REQUESTS:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "cs2dl/3"})
+            if r.status_code == 200:
+                c = r.json().get("result", {}).get("nextcode", "")
+                if c and c != "n/a":
+                    return c, True, 200
+                return None, True, 200    # legitimate end of chain
+            if r.status_code == 202:
+                return None, True, 202    # no new match yet = clean end
+            if r.status_code == 403:
+                return None, False, 403   # wrong API key — stop retrying
+            if r.status_code == 412:
+                return None, False, 412   # share code mismatch — needs reset
+            return None, False, r.status_code
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": "cs2dl/3"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            c = data.get("result", {}).get("nextcode", "")
+            if c and c != "n/a":
+                return c, True, 200
+            return None, True, 200
+    except Exception:
+        return None, False, -1
 
 def collect_codes(player, known_ids):
     start = player.get("last_known_code") or player.get("oldest_share_code", "")
@@ -530,10 +596,30 @@ def collect_codes(player, known_ids):
     except ValueError:
         pass
     cur, seen = start, {start}
+    failures = 0
+    max_failures = 5
     while True:
-        nxt = _next_code(player["api_key"], player["steam_id"],
-                         player["auth_code"], cur)
-        if not nxt or nxt in seen: break
+        nxt, ok, status = _next_code(player["api_key"], player["steam_id"],
+                                     player["auth_code"], cur)
+        if not ok:
+            if status == 403:
+                print("  [✗]  API returned 403 — check your API key and auth code")
+                break
+            if status == 412:
+                print("  [✗]  API returned 412 — share code mismatch, "
+                      "use option 8 and enter a recent code from this account")
+                break
+            failures += 1
+            if failures >= max_failures:
+                print(f"  [⚠]  API failed {failures} times in a row, stopping chain")
+                break
+            print(f"  [⚠]  API call failed (HTTP {status}), "
+                  f"retrying ({failures}/{max_failures})…")
+            time.sleep(RETRY_BACKOFF * failures)
+            continue
+        failures = 0                # reset on success
+        if not nxt or nxt in seen:
+            break                   # legitimate end of chain
         seen.add(nxt); codes.append(nxt); cur = nxt
         time.sleep(API_RATE_DELAY)
     print(f"  [→] {len(codes)} new match(es)")
@@ -571,14 +657,16 @@ def resolve_urls(codes, boiler, known_ids, dl_path, debug=False):
             if rc == 8:
                 stats["expired"] += 1
                 print(f"{pre} [⌛]  Expired")
-                stats["last_ok_code"] = code
+                stats["last_ok_code"] = code   # permanently gone, safe to skip
             else:
                 stats["errors"] += 1
-                print(f"{pre} [!]   No URL")
+                print(f"{pre} [!]   No URL (boiler rc={rc})")
+                # do NOT advance cursor — boiler errors are transient, retry next run
         else:
             tasks.append({"mid":mid, "oid":oid, "name":name, "url":url, "code":code})
             stats["resolved"] += 1
             print(f"{pre} [✓]   URL ready")
+            # cursor advances only after confirmed download (handled in run_scan)
         if i < total: time.sleep(BOILER_DELAY)
     return tasks, stats
 
@@ -603,7 +691,18 @@ def _dl_one(task, dl_path, known_ids, display=None):
     name, url = task["name"], task["url"]
     final = dl_path / f"{name}.dem"
 
-    if final.exists() or _is_present(mid, known_ids):
+    # Check exact file AND any file with same match id, recursively,
+    # including non-zero-padded names from other tools
+    mid_str   = f"match730_{mid:021d}_"
+    mid_plain = str(mid)
+    already = (
+        final.exists()
+        or _is_present(mid, known_ids)
+        or any(dl_path.rglob(f"{mid_str}*.dem"))
+        or any(dl_path.rglob(f"*{mid_plain}*.dem"))
+    )
+    if already:
+        known_ids.add(str(mid))
         if display:
             display.assign(name)
             display.set_status(name, "ok")
@@ -621,7 +720,10 @@ def _dl_one(task, dl_path, known_ids, display=None):
     ok, err = _http_download(url, tmp, name[-22:], on_progress=on_progress)
     if not ok:
         tmp.unlink(missing_ok=True)
-        reason = f"Download failed: {err[:80]}"
+        if any(code in err for code in ("502", "503", "504")):
+            reason = f"Valve CDN error (retry next run): {err[:60]}"
+        else:
+            reason = f"Download failed: {err[:80]}"
         if display: display.set_status(name, "fail", reason)
         return False, reason
 
