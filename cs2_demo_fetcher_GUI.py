@@ -210,8 +210,8 @@ def decode_share_code(code: str) -> Tuple[int, int, int]:
         int.from_bytes(raw[16:18], "little"),
     )
 
-def csdm_name(mid, oid):
-    return f"match730_{mid:021d}_{oid & 0xFFFFFFFF}"
+def csdm_name(mid, oid, token):
+    return f"match730_{mid:021d}_{oid & 0xFFFFFFFF:010d}_{token}"
 
 def _selftest():
     m, r, t = decode_share_code("CSGO-GADqf-jjyJ8-cSP2r-smZRo-TO2xK")
@@ -583,7 +583,7 @@ def resolve_urls(codes, boiler, known_ids, dl_path, log=print):
         if _is_present(mid, known_ids):
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
 
-        name  = csdm_name(mid, oid)
+        name  = csdm_name(mid, oid, token)
         final = dl_path / f"{name}.dem"
 
         # ◄◄◄ FIXED — also glob for any file with this match id (different oid)
@@ -651,11 +651,12 @@ def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     tmp = dl_path / f"_tmp_{name}{suffix}"
 
     def on_prog(dl, total):
-        if progress_cb: progress_cb(name, dl, total)
+        if progress_cb: progress_cb(name, dl, total, "downloading")
 
     ok, err = _http_download(url, tmp, on_progress=on_prog)
     if not ok:
         tmp.unlink(missing_ok=True)
+        if progress_cb: progress_cb(name, 0, 0, "failed")
         # 5xx = Valve CDN blip, cursor was not advanced, will retry next run
         if any(code in err for code in ("502", "503", "504")):
             return False, f"Valve CDN error (retry next run): {err[:60]}"
@@ -664,20 +665,26 @@ def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     verr = _validate_file(tmp, is_bz2)
     if verr:
         tmp.unlink(missing_ok=True)
+        if progress_cb: progress_cb(name, 0, 0, "failed")
         return False, verr
 
     if is_bz2:
+        # Signal extraction phase — file is downloaded but NOT done yet
+        if progress_cb: progress_cb(name, 0, 0, "extracting")
         dem = dl_path / f"_tmp_{name}.dem"
         ok, berr = _decompress_bz2(tmp, dem)
         tmp.unlink(missing_ok=True)
         if not ok:
             dem.unlink(missing_ok=True)
+            if progress_cb: progress_cb(name, 0, 0, "failed")
             return False, f"bz2: {berr[:80]}"
         dem.rename(final)
     else:
         tmp.rename(final)
 
     known_ids.add(str(mid))
+    # Only NOW is the demo truly done — no tmp files, fully extracted
+    if progress_cb: progress_cb(name, 0, 0, "done")
     return True, ""
 
 # ◄◄◄ FIXED — separate skipped from actually downloaded
@@ -1089,26 +1096,50 @@ class App(tk.Tk):
 
     # ── PROGRESS (thread-safe) ───────────────────────────────
 
-    def _progress_cb(self, name, dl, total):
-        if total <= 0:
-            return
-
+    def _progress_cb(self, name, dl, total, phase="downloading"):
         with self._dl_progress_lock:
-            self._dl_progress[name] = (dl, total)
-            agg_dl    = sum(d for d, _ in self._dl_progress.values())
-            agg_total = sum(t for _, t in self._dl_progress.values())
+            if phase == "downloading":
+                if total <= 0:
+                    return
+                self._dl_progress[name] = (dl, total, "downloading")
+            elif phase == "extracting":
+                # Bytes are fully downloaded; keep totals, change phase
+                prev = self._dl_progress.get(name)
+                if prev:
+                    self._dl_progress[name] = (prev[1], prev[1], "extracting")
+                else:
+                    return
+            elif phase in ("done", "failed"):
+                prev = self._dl_progress.get(name)
+                if prev:
+                    self._dl_progress[name] = (prev[1], prev[1], phase)
+                else:
+                    return
+
+            agg_dl    = sum(d for d, _, _ in self._dl_progress.values())
+            agg_total = sum(t for _, t, _ in self._dl_progress.values())
+            snapshot  = list(self._dl_progress.values())
 
         now = time.monotonic()
-        is_done = dl >= total
-        if not is_done and (now - self._last_progress_update) < 0.1:
+        # Throttle only the high-frequency "downloading" updates
+        if phase == "downloading" and (now - self._last_progress_update) < 0.1:
             return
         self._last_progress_update = now
 
         pct = agg_dl * 100 / agg_total if agg_total > 0 else 0
-        active = len([1 for d, t in self._dl_progress.values() if d < t])
-        done   = len([1 for d, t in self._dl_progress.values() if d >= t])
-        msg = (f"⬇ {done} done, {active} active  "
-               f"({agg_dl >> 20}/{agg_total >> 20} MB)")
+
+        done_count       = sum(1 for _, _, p in snapshot if p == "done")
+        extracting_count = sum(1 for _, _, p in snapshot if p == "extracting")
+        active_count     = sum(1 for d, t, p in snapshot if p == "downloading" and d < t)
+        failed_count     = sum(1 for _, _, p in snapshot if p == "failed")
+
+        parts = []
+        if active_count:     parts.append(f"{active_count} downloading")
+        if extracting_count: parts.append(f"{extracting_count} extracting")
+        if done_count:       parts.append(f"{done_count} done")
+        if failed_count:     parts.append(f"{failed_count} failed")
+        status_text = ", ".join(parts) if parts else "processing"
+        msg = f"⬇ {status_text}  ({agg_dl >> 20}/{agg_total >> 20} MB)"
 
         self.after(0, lambda p=pct, m=msg: (
             self.progress_var.set(p),
@@ -1228,6 +1259,11 @@ class App(tk.Tk):
             self._dl_progress.clear()
             self.after(0, lambda: self.status_var.set("Scanning…"))
             run_scan(self.cfg, self.dl_path, log=self._log, progress_cb=self._progress_cb)
+            # ◄◄◄ Final safety net — make sure every _tmp_ file is gone
+            #     before the worker returns and status becomes "Ready"
+            remaining = _cleanup_tmp(self.dl_path)
+            if remaining:
+                self._log(f"[🧹]  {remaining} leftover temp file(s) cleaned")
             self._refresh_players()
         self._run_threaded(do)
 
