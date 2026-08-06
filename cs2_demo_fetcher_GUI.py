@@ -7,6 +7,7 @@ CSDM naming: match730_MATCHID_RESERVATIONID.dem
 """
 
 import bz2
+import hashlib
 import json
 import os
 import platform
@@ -399,6 +400,19 @@ def install_boiler(log=print):
     log(f"  [→] Downloading {asset['name']}…")
     ok, err = _http_download(asset["browser_download_url"], arc)
     if not ok: log(f"  [✗] Download failed: {err}"); return None
+    digest = asset.get("digest", "")
+    if digest.startswith("sha256:"):
+        expected = digest.split(":", 1)[1]
+        h = hashlib.sha256()
+        with open(arc, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                h.update(chunk)
+        if h.hexdigest() != expected:
+            log(f"  [✗] Checksum mismatch — aborting")
+            arc.unlink(missing_ok=True); return None
+        log(f"  [✓] sha256 verified")
+    else:
+        log("  [!] No digest published — skipping integrity check")
     try:
         if arc.suffix == ".zip":
             with zipfile.ZipFile(arc) as z: _safe_zip_extract(z, BOILER_DIR)
@@ -426,18 +440,37 @@ def ensure_boiler(log=print):
 # ════════════════════════════════════════════════════════════════
 
 def _kill_boiler(boiler):
+    """Kill only OUR boiler-writter instance, matched by full path —
+    not by bare process name, which could hit an unrelated process
+    that happens to share the same name elsewhere on the machine."""
+    full_path = str(boiler.resolve())
     try:
         if platform.system() == "Windows":
+            try:
+                q = subprocess.run(
+                    ["wmic", "process", "where",
+                     f"ExecutablePath='{full_path}'", "get", "ProcessId"],
+                    capture_output=True, timeout=5, text=True)
+                pids = [p.strip() for p in q.stdout.splitlines()[1:] if p.strip().isdigit()]
+                for pid in pids:
+                    subprocess.run(["taskkill","/F","/PID",pid,"/T"],
+                                   capture_output=True, timeout=5)
+                if pids:
+                    return
+            except Exception:
+                pass
             subprocess.run(["taskkill","/F","/IM",boiler.name,"/T"],
                            capture_output=True, timeout=5)
         else:
-            subprocess.run(["pkill","-9","-f",boiler.name],
+            subprocess.run(["pkill","-9","-f",full_path],
                            capture_output=True, timeout=5)
     except Exception: pass
 
 def _boiler_url(boiler, mid, oid, token, *, _retry=False, log=print):
     _kill_boiler(boiler)
-    out = Path(tempfile.mktemp(suffix=".bin"))
+    fd, out_str = tempfile.mkstemp(suffix=".bin")
+    os.close(fd)
+    out = Path(out_str)
     try:
         r = subprocess.run(
             [str(boiler), str(out), str(mid), str(oid), str(token)],
@@ -468,7 +501,9 @@ def _boiler_url(boiler, mid, oid, token, *, _retry=False, log=print):
 
 def _boiler_test(boiler, log=print):
     _kill_boiler(boiler)
-    out = Path(tempfile.mktemp(suffix=".bin"))
+    fd, out_str = tempfile.mkstemp(suffix=".bin")
+    os.close(fd)
+    out = Path(out_str)
     log("  [🔧] Testing GC connection…")
     try:
         r = subprocess.run([str(boiler), str(out)],
@@ -844,19 +879,33 @@ class PlayerDialog(tk.Toplevel):
         d = data or {}
         self.entries = {}
 
+        SECRET_FIELDS = {"api_key", "auth_code"}
+
         for i, (key, label, _) in enumerate(self.FIELDS):
             val = d.get(key, d.get("oldest_share_code", "")) if key == "last_known_code" and not d.get(key) else d.get(key, "")
 
             lbl = tk.Label(self, text=label, bg=PAL["bg"], fg=PAL["fg"])
             lbl.grid(row=i, column=0, sticky="e", padx=(10, 5), pady=4)
 
+            is_secret = key in SECRET_FIELDS
             e = tk.Entry(self, width=45, bg=PAL["alt_bg"], fg=PAL["fg"],
                          insertbackground=PAL["fg"], relief="flat",
                          highlightthickness=1, highlightcolor=PAL["accent"],
-                         highlightbackground=PAL["btn_bg"])
+                         highlightbackground=PAL["btn_bg"],
+                         show=("•" if is_secret else ""))
             e.insert(0, val)
             e.grid(row=i, column=1, padx=(0, 5), pady=4)
             self.entries[key] = e
+
+            if is_secret:
+                btn = tk.Button(self, text="👁", width=2, relief="flat",
+                                bg=PAL["btn_bg"], fg=PAL["fg"],
+                                activebackground=PAL["btn_hov"], cursor="hand2")
+                btn.config(command=lambda entry=e, b=btn: (
+                    entry.config(show="" if entry.cget("show") else "•"),
+                    b.config(text="🙈" if not entry.cget("show") else "👁")
+                ))
+                btn.grid(row=i, column=3, padx=(2, 0), pady=4)
 
             link = self.LINKS.get(key)
             if link:

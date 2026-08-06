@@ -7,6 +7,7 @@ CSDM naming: match730_MATCHID_RESERVATIONID.dem
 """
 
 import bz2
+import hashlib
 import json
 import os
 import platform
@@ -449,6 +450,21 @@ def install_boiler():
     arc = BOILER_DIR / asset["name"]
     ok, _ = _http_download(asset["browser_download_url"], arc, asset["name"])
     if not ok: return None
+    digest = asset.get("digest", "")
+    if digest.startswith("sha256:"):
+        expected = digest.split(":", 1)[1]
+        h = hashlib.sha256()
+        with open(arc, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                h.update(chunk)
+        actual = h.hexdigest()
+        if actual != expected:
+            print(f"  [✗] Checksum mismatch! expected {expected[:12]}… got {actual[:12]}…")
+            arc.unlink(missing_ok=True)
+            return None
+        print(f"  [✓] sha256 verified")
+    else:
+        print("  [!] No digest published for this asset — skipping integrity check")
     try:
         if arc.suffix == ".zip":
             with zipfile.ZipFile(arc) as z: _safe_zip_extract(z, BOILER_DIR)
@@ -477,19 +493,41 @@ def ensure_boiler():
 # ════════════════════════════════════════════════════════════════
 
 def _kill_boiler(boiler):
+    """Kill only OUR boiler-writter instance, matched by full path —
+    not by bare process name, which could hit an unrelated process
+    that happens to share the same name elsewhere on the machine."""
+    full_path = str(boiler.resolve())
     try:
         if platform.system() == "Windows":
+            # taskkill /IM only matches by image name (no path filter),
+            # so query for the exact executable path first via wmic and
+            # kill by PID; fall back to name-based taskkill if wmic fails.
+            try:
+                q = subprocess.run(
+                    ["wmic", "process", "where",
+                     f"ExecutablePath='{full_path}'", "get", "ProcessId"],
+                    capture_output=True, timeout=5, text=True)
+                pids = [p.strip() for p in q.stdout.splitlines()[1:] if p.strip().isdigit()]
+                for pid in pids:
+                    subprocess.run(["taskkill","/F","/PID",pid,"/T"],
+                                   capture_output=True, timeout=5)
+                if pids:
+                    return
+            except Exception:
+                pass
             subprocess.run(["taskkill","/F","/IM",boiler.name,"/T"],
                            capture_output=True, timeout=5)
         else:
-            subprocess.run(["pkill","-9","-f",boiler.name],
+            subprocess.run(["pkill","-9","-f",full_path],
                            capture_output=True, timeout=5)
     except Exception:
         pass
 
 def _boiler_url(boiler, mid, oid, token, *, _retry=False, debug=False):
     _kill_boiler(boiler)
-    out = Path(tempfile.mktemp(suffix=".bin"))
+    fd, out_str = tempfile.mkstemp(suffix=".bin")
+    os.close(fd)
+    out = Path(out_str)
     cmd = [str(boiler), str(out), str(mid), str(oid), str(token)]
     if debug: _safe_print(f"    [DEBUG] CMD: {' '.join(cmd)}")
     try:
@@ -522,7 +560,9 @@ def _boiler_url(boiler, mid, oid, token, *, _retry=False, debug=False):
 
 def _boiler_recent_matches(boiler, debug=False):
     _kill_boiler(boiler)
-    out = Path(tempfile.mktemp(suffix=".bin"))
+    fd, out_str = tempfile.mkstemp(suffix=".bin")
+    os.close(fd)
+    out = Path(out_str)
     print("  [🔧] Testing GC connection…")
     try:
         r = subprocess.run([str(boiler), str(out)],

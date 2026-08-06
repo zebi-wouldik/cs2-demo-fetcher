@@ -1,0 +1,21 @@
+# Contains plaintext Steam API keys / auth codes — never commit
+config.json
+*.cfg_*.tmp
+
+# Auto-fetched binary, platform-specific, re-downloaded on demand
+boiler/
+
+# Downloaded demos
+*.dem
+*.dem.bz2
+_tmp_*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
