@@ -57,7 +57,6 @@ SHARECODE_BASE     = len(SHARECODE_ALPHABET)
 DOWNLOAD_WORKERS  = 4
 # Max observed ID difference between the SAME match downloaded by two different tools.
 # Consecutive DIFFERENT matches always differ by more than this.
-_SAME_MATCH_THRESHOLD = 6_000_000_000_000   # 6 trillion
 
 BOILER_DELAY      = 4
 API_RATE_DELAY    = 0.4
@@ -86,7 +85,7 @@ PLATFORM_ASSETS = {
 }
 
 _RE_STEAMID      = re.compile(r'^\d{17}$')
-_RE_MID          = re.compile(r'(?:match730_)?(0*\d{16,21})[_\-]\d')
+_RE_BIGNUM       = re.compile(r'\d{8,21}')
 _RE_DEMO_URL     = re.compile(r'https?://[^\x00-\x1f\x7f\s]{15,}\.dem(?:\.bz2)?')
 _RE_FALLBACK_URL = re.compile(r'https?://[^\x00-\x1f\x7f\s]{15,}')
 _BZ2_MAGIC       = b'BZ'
@@ -97,44 +96,23 @@ _BZ2_MAGIC       = b'BZ'
 # ════════════════════════════════════════════════════════════════
 
 class _SafeSet:
-    __slots__ = ('_data', '_ints', '_lock')
+    __slots__ = ('_data', '_lock')
 
     def __init__(self, initial=None):
-        self._data = set()
-        self._ints = set()   # integer versions for proximity check
+        self._data = set(initial) if initial else set()
         self._lock = threading.Lock()
-        if initial:
-            for item in initial:
-                self._data.add(item)
-                try:
-                    self._ints.add(int(item))
-                except (ValueError, TypeError):
-                    pass
 
     def add(self, item):
         with self._lock:
             self._data.add(item)
-            try:
-                self._ints.add(int(item))
-            except (ValueError, TypeError):
-                pass
+
+    def update(self, items):
+        with self._lock:
+            self._data.update(items)
 
     def __contains__(self, item):
         with self._lock:
-            # 1. Exact match (fast path)
-            if item in self._data:
-                return True
-            # 2. Proximity match — same match downloaded by a different tool
-            #    produces an ID up to ~5T different. Consecutive different
-            #    matches always differ by >7T, so 6T threshold is safe.
-            try:
-                v = int(item)
-                return any(
-                    abs(v - x) <= _SAME_MATCH_THRESHOLD
-                    for x in self._ints
-                )
-            except (ValueError, TypeError):
-                return False
+            return item in self._data
 
     def __len__(self):
         with self._lock: return len(self._data)
@@ -268,17 +246,34 @@ def _selftest():
 # ════════════════════════════════════════════════════════════════
 
 def _scan_folder(path: Path) -> _SafeSet:
+    """Index every ≥8-digit number found in every .dem filename — not just
+    the first one, and not assuming which position holds matchId vs
+    reservationId. Works regardless of which tool wrote the file, as long
+    as it embeds the numeric id(s) somewhere in the name."""
     ids = set()
-    for dem in path.rglob("*.dem"):   # rglob = subfolders too
-        m = _RE_MID.search(dem.stem)
-        if m:
+    for dem in path.rglob("*.dem"):
+        for m in _RE_BIGNUM.finditer(dem.stem):
             try:
-                ids.add(str(int(m.group(1))))
-            except (ValueError, TypeError):
+                ids.add(str(int(m.group(0))))   # normalize away leading zeros
+            except ValueError:
                 pass
     return _SafeSet(ids)
 
-def _is_present(mid, known): return str(mid) in known
+def _match_keys(mid, oid=None):
+    """Every exact string form a match's id could legitimately appear as
+    in a filename: full matchId, full reservationId, and reservationId
+    truncated to 32 bits (as csdm_name() does)."""
+    keys = {str(mid)}
+    if oid is not None:
+        keys.add(str(oid))
+        keys.add(str(oid & 0xFFFFFFFF))
+    return keys
+
+def _is_present(known, mid, oid=None):
+    return any(k in known for k in _match_keys(mid, oid))
+
+def _register(known, mid, oid=None):
+    known.update(_match_keys(mid, oid))
 
 def _cleanup_tmp(dl_path: Path) -> int:
     count = 0
@@ -631,8 +626,8 @@ def collect_codes(player, known_ids):
         print("  [!] No share code configured."); return []
     codes = []
     try:
-        mid, _, _ = decode_share_code(start)
-        if not _is_present(mid, known_ids): codes.append(start)
+        mid, oid, _ = decode_share_code(start)
+        if not _is_present(known_ids, mid, oid): codes.append(start)
     except ValueError:
         pass
     cur, seen = start, {start}
@@ -682,13 +677,13 @@ def resolve_urls(codes, boiler, known_ids, dl_path, debug=False):
             stats["errors"] += 1; continue
         if debug:
             print(f"{pre} [DEBUG] mid={mid} oid={oid} tok={token}")
-        if _is_present(mid, known_ids):
+        if _is_present(known_ids, mid, oid):
             print(f"{pre} [⏭]  Already present")
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
         name  = csdm_name(mid, oid)
         final = dl_path / f"{name}.dem"
         if final.exists():
-            known_ids.add(str(mid))
+            _register(known_ids, mid, oid)
             print(f"{pre} [⏭]  File exists")
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
         print(f"{pre} [🔍]  {code}  →  boiler…")
@@ -737,12 +732,12 @@ def _dl_one(task, dl_path, known_ids, display=None):
     mid_plain = str(mid)
     already = (
         final.exists()
-        or _is_present(mid, known_ids)
+        or _is_present(known_ids, mid, oid)
         or any(dl_path.rglob(f"{mid_str}*.dem"))
         or any(dl_path.rglob(f"*{mid_plain}*.dem"))
     )
     if already:
-        known_ids.add(str(mid))
+        _register(known_ids, mid, oid)
         if display:
             display.assign(name)
             display.set_status(name, "ok")
@@ -788,7 +783,7 @@ def _dl_one(task, dl_path, known_ids, display=None):
         tmp.rename(final)
 
     if display: display.set_status(name, "ok")
-    known_ids.add(str(mid))
+    _register(known_ids, mid, oid)
     return True, ""
 
 
@@ -872,7 +867,7 @@ def run_scan(cfg, dl_path, debug=False):
             if mid_str in seen_mids:
                 dupes += 1; continue
             seen_mids.add(mid_str)
-            known_ids.add(mid_str)
+            _register(known_ids, t["mid"], t["oid"])
             unique_tasks.append(t)
 
         parts = []

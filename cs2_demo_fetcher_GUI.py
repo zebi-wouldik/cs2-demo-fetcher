@@ -95,9 +95,6 @@ SHARECODE_ALPHABET = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefhijkmnopqrstuvwxyz23456789"
 SHARECODE_BASE     = len(SHARECODE_ALPHABET)
 
 DOWNLOAD_WORKERS  = 4
-# Max observed ID difference between the SAME match downloaded by two different tools.
-# Consecutive DIFFERENT matches always differ by more than this (~7.9T minimum observed).
-_SAME_MATCH_THRESHOLD = 6_000_000_000_000   # 6 trillion
 BOILER_DELAY      = 4
 API_RATE_DELAY    = 0.4
 MAX_RETRIES       = 3
@@ -124,7 +121,7 @@ PLATFORM_ASSETS = {
 }
 
 _RE_STEAMID      = re.compile(r'^\d{17}$')
-_RE_MID          = re.compile(r'(?:match730_)?(0*\d{16,21})[_\-]\d')
+_RE_BIGNUM       = re.compile(r'\d{8,21}')
 _RE_DEMO_URL     = re.compile(r'https?://[^\x00-\x1f\x7f\s]{15,}\.dem(?:\.bz2)?')
 _RE_FALLBACK_URL = re.compile(r'https?://[^\x00-\x1f\x7f\s]{15,}')
 _BZ2_MAGIC       = b'BZ'
@@ -137,44 +134,23 @@ _SKIPPED = "__skipped__"
 # ════════════════════════════════════════════════════════════════
 
 class _SafeSet:
-    __slots__ = ('_data', '_ints', '_lock')
+    __slots__ = ('_data', '_lock')
 
     def __init__(self, initial=None):
-        self._data = set()
-        self._ints = set()   # integer versions for proximity check
+        self._data = set(initial) if initial else set()
         self._lock = threading.Lock()
-        if initial:
-            for item in initial:
-                self._data.add(item)
-                try:
-                    self._ints.add(int(item))
-                except (ValueError, TypeError):
-                    pass
 
     def add(self, item):
         with self._lock:
             self._data.add(item)
-            try:
-                self._ints.add(int(item))
-            except (ValueError, TypeError):
-                pass
+
+    def update(self, items):
+        with self._lock:
+            self._data.update(items)
 
     def __contains__(self, item):
         with self._lock:
-            # 1. Exact match (fast path)
-            if item in self._data:
-                return True
-            # 2. Proximity match — same match downloaded by a different tool
-            #    produces a match ID up to ~5T different from ours.
-            #    Consecutive DIFFERENT matches always differ by >7T, so 6T is safe.
-            try:
-                v = int(item)
-                return any(
-                    abs(v - x) <= _SAME_MATCH_THRESHOLD
-                    for x in self._ints
-                )
-            except (ValueError, TypeError):
-                return False
+            return item in self._data
 
     def __len__(self):
         with self._lock: return len(self._data)
@@ -228,18 +204,31 @@ def _valid_share_code(code):
 # ════════════════════════════════════════════════════════════════
 
 def _scan_folder(path: Path) -> _SafeSet:
+    """Index every ≥8-digit number found in every .dem filename — not just
+    the first one, and not assuming which position holds matchId vs
+    reservationId. Works regardless of which tool wrote the file."""
     ids = set()
     # rglob instead of glob → scans subfolders too
     for dem in path.rglob("*.dem"):
-        m = _RE_MID.search(dem.stem)
-        if m:
+        for m in _RE_BIGNUM.finditer(dem.stem):
             try:
-                ids.add(str(int(m.group(1))))
+                ids.add(str(int(m.group(0))))   # normalize away leading zeros
             except ValueError:
                 pass
     return _SafeSet(ids)
 
-def _is_present(mid, known): return str(mid) in known
+def _match_keys(mid, oid=None):
+    keys = {str(mid)}
+    if oid is not None:
+        keys.add(str(oid))
+        keys.add(str(oid & 0xFFFFFFFF))
+    return keys
+
+def _is_present(known, mid, oid=None):
+    return any(k in known for k in _match_keys(mid, oid))
+
+def _register(known, mid, oid=None):
+    known.update(_match_keys(mid, oid))
 
 def _cleanup_tmp(dl_path: Path) -> int:
     count = 0
@@ -564,8 +553,8 @@ def collect_codes(player, known_ids, log=print):
     if not start: log("  [!] No share code configured."); return []
     codes = []
     try:
-        mid, _, _ = decode_share_code(start)
-        if not _is_present(mid, known_ids): codes.append(start)
+        mid, oid, _ = decode_share_code(start)
+        if not _is_present(known_ids, mid, oid): codes.append(start)
     except ValueError: pass
     cur, seen = start, {start}
     failures = 0
@@ -614,19 +603,18 @@ def resolve_urls(codes, boiler, known_ids, dl_path, log=print):
             log(f"{pre} [⏭]  Invalid: {code[:40]}…")
             stats["errors"] += 1; continue
 
-        # ◄◄◄ FIXED — check BOTH match-id index AND any file on disk with this mid
-        if _is_present(mid, known_ids):
+        if _is_present(known_ids, mid, oid):
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
 
         name  = csdm_name(mid, oid, token)
         final = dl_path / f"{name}.dem"
 
-        # ◄◄◄ FIXED — also glob for any file with this match id (different oid)
+        # also glob for any file with this match id (different oid/token)
         mid_str = f"match730_{mid:021d}_"
         already_on_disk = final.exists() or any(dl_path.glob(f"{mid_str}*.dem"))
 
         if already_on_disk:
-            known_ids.add(str(mid))
+            _register(known_ids, mid, oid)
             stats["skipped"] += 1; stats["last_ok_code"] = code; continue
 
         log(f"{pre} [🔍]  {code}  →  boiler…")
@@ -673,12 +661,12 @@ def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     mid_plain = str(mid)  # without zero-padding, for tools that don't zero-pad
     already = (
         final.exists()
-        or _is_present(mid, known_ids)
+        or _is_present(known_ids, mid, oid)
         or any(dl_path.rglob(f"{mid_str}*.dem"))        # zero-padded, any subfolder
         or any(dl_path.rglob(f"*{mid_plain}*.dem"))     # non-padded, any subfolder
     )
     if already:
-        known_ids.add(str(mid))
+        _register(known_ids, mid, oid)
         return True, _SKIPPED
 
     is_bz2 = url.endswith(".bz2")
@@ -717,7 +705,7 @@ def _dl_one(task, dl_path, known_ids, log=print, progress_cb=None):
     else:
         tmp.rename(final)
 
-    known_ids.add(str(mid))
+    _register(known_ids, mid, oid)
     # Only NOW is the demo truly done — no tmp files, fully extracted
     if progress_cb: progress_cb(name, 0, 0, "done")
     return True, ""
