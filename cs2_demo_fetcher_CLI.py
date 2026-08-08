@@ -6,6 +6,8 @@ Downloads demos via Steam API (auth code, like Leetify).
 CSDM naming: match730_MATCHID_RESERVATIONID.dem
 """
 
+__version__ = "3.3.3"
+
 import bz2
 import hashlib
 import json
@@ -1066,7 +1068,8 @@ def test_gc(cfg):
 
 def main():
     print("\n╔══════════════════════════════════════════════════════════╗")
-    print("║            CS2 Demo Downloader — Leetify Style           ║")
+    _banner = f"CS2 Demo Downloader v{__version__} — Leetify Style"
+    print(f"║{_banner.center(58)}║")
     print("╚══════════════════════════════════════════════════════════╝")
     if not HAS_REQUESTS:
         print("\n[⚠]  pip install requests\n")

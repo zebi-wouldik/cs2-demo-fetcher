@@ -6,6 +6,8 @@ Downloads demos via Steam API (auth code, like Leetify).
 CSDM naming: match730_MATCHID_RESERVATIONID.dem
 """
 
+__version__ = "3.3.3"
+
 import bz2
 import hashlib
 import json
@@ -995,7 +997,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         _apply_theme(self)
-        self.title("CS2 Demo Downloader")
+        self.title(f"CS2 Demo Downloader v{__version__}")
         self.geometry("920x660")
         self.minsize(750, 500)
 
