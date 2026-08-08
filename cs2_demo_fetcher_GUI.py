@@ -594,17 +594,25 @@ def collect_codes(player, known_ids, log=print):
 
 def resolve_urls(codes, boiler, known_ids, dl_path, log=print):
     tasks, total = [], len(codes)
-    stats = {"resolved":0, "expired":0, "skipped":0, "errors":0, "last_ok_code":None}
+    # timeline = chain-ordered (code, state) used to advance the cursor safely.
+    #   state True  → definitively done, cursor may pass
+    #   state False → transient failure, cursor must STOP here
+    #   state int   → match id, resolved after the download phase
+    stats = {"resolved":0, "expired":0, "skipped":0, "errors":0,
+             "last_ok_code":None, "timeline":[]}
     for i, code in enumerate(codes, 1):
         pre = f"  [{i}/{total}]"
         try:
             mid, oid, token = decode_share_code(code)
         except ValueError:
             log(f"{pre} [⏭]  Invalid: {code[:40]}…")
-            stats["errors"] += 1; continue
+            stats["errors"] += 1
+            stats["timeline"].append((code, True))   # never decodable, skip forever
+            continue
 
         if _is_present(known_ids, mid, oid):
-            stats["skipped"] += 1; stats["last_ok_code"] = code; continue
+            stats["skipped"] += 1; stats["last_ok_code"] = code
+            stats["timeline"].append((code, True)); continue
 
         name  = csdm_name(mid, oid, token)
         final = dl_path / f"{name}.dem"
@@ -615,7 +623,8 @@ def resolve_urls(codes, boiler, known_ids, dl_path, log=print):
 
         if already_on_disk:
             _register(known_ids, mid, oid)
-            stats["skipped"] += 1; stats["last_ok_code"] = code; continue
+            stats["skipped"] += 1; stats["last_ok_code"] = code
+            stats["timeline"].append((code, True)); continue
 
         log(f"{pre} [🔍]  {code}  →  boiler…")
         url, rc = _boiler_url(boiler, mid, oid, token, log=log)
@@ -623,14 +632,17 @@ def resolve_urls(codes, boiler, known_ids, dl_path, log=print):
             if rc == 8:
                 stats["expired"] += 1; log(f"{pre} [⌛]  Expired")
                 stats["last_ok_code"] = code   # expired = permanently gone, safe to skip
+                stats["timeline"].append((code, True))
             else:
                 stats["errors"] += 1; log(f"{pre} [!]   No URL (boiler rc={rc})")
-                # do NOT set last_ok_code — boiler errors are transient, retry next run
+                # boiler errors are transient → cursor must stop here so the
+                # match is re-enumerated next run
+                stats["timeline"].append((code, False))
         else:
             tasks.append({"mid":mid, "oid":oid, "name":name, "url":url, "code":code})
             stats["resolved"] += 1; log(f"{pre} [✓]   URL ready")
-            # intentionally NOT setting last_ok_code here — cursor advances
-            # only after a confirmed download (handled in run_scan via best dict)
+            # cursor advances only if this one really lands on disk
+            stats["timeline"].append((code, mid))
         if i < total: time.sleep(BOILER_DELAY)
     return tasks, stats
 
@@ -771,7 +783,7 @@ def run_scan(cfg, dl_path, log=print, progress_cb=None):
     if cleaned: log(f"[🧹]  {cleaned} temp file(s) removed")
     log(f"[📂]  {len(known_ids)} demo(s) already indexed.\n")
 
-    all_tasks, task_player, player_cursor, seen_mids = [], {}, {}, set()
+    all_tasks, task_player, player_timeline, seen_mids = [], {}, {}, set()
 
     for player in players:
         pid = player["steam_id"]
@@ -795,38 +807,23 @@ def run_scan(cfg, dl_path, log=print, progress_cb=None):
         log(f"  [Σ] {' | '.join(parts) if parts else 'nothing'}")
         if stats["expired"] and not stats["resolved"]:
             log("  [⚠]  All expired — update share code.\n")
-        if stats["last_ok_code"]: player_cursor[pid] = stats["last_ok_code"]
+        player_timeline[pid] = stats["timeline"]
         for t in unique: task_player[t["name"]] = player
         all_tasks.extend(unique); log("")
 
-    # Advance cursor for players that had skipped codes (before downloading)
-    for p in players:
-        if p["steam_id"] in player_cursor:
-            p["last_known_code"] = player_cursor[p["steam_id"]]
-
     downloaded, skipped = download_all(all_tasks, dl_path, known_ids, log, progress_cb)
 
-    # Only advance cursor further based on ACTUALLY downloaded demos
-    order = {t["name"]: i for i, t in enumerate(all_tasks)}
-    best: Dict[str, Tuple[int, str]] = {}
-    for t in downloaded:  # ◄◄◄ FIXED — only real downloads, not skips
-        p = task_player.get(t["name"])
-        if not p: continue
-        pid, o, c = p["steam_id"], order.get(t["name"], -1), t.get("code", "")
-        if c:
-            prev = best.get(pid, (-1, ""))
-            if o > prev[0]: best[pid] = (o, c)
-    # Also count skipped demos for cursor (they exist on disk = safe to advance past)
-    for t in skipped:
-        p = task_player.get(t["name"])
-        if not p: continue
-        pid, o, c = p["steam_id"], order.get(t["name"], -1), t.get("code", "")
-        if c:
-            prev = best.get(pid, (-1, ""))
-            if o > prev[0]: best[pid] = (o, c)
+    # ◄◄◄ FIXED — advance the cursor only up to the last CONTIGUOUS success.
+    # Jumping to the newest downloaded demo used to skip over matches that
+    # failed mid-chain (Valve CDN 502), so they were never retried.
+    ok_mids = {t["mid"] for t in downloaded} | {t["mid"] for t in skipped}
     for p in players:
-        if p["steam_id"] in best:
-            p["last_known_code"] = best[p["steam_id"]][1]
+        cursor = None
+        for code, state in player_timeline.get(p["steam_id"], []):
+            done = state is True or (state is not False and state in ok_mids)
+            if not done: break          # stop at the first hole in the chain
+            cursor = code
+        if cursor: p["last_known_code"] = cursor
 
     save_config(cfg)
     log(f"\n{'═'*56}")
